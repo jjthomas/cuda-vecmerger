@@ -32,6 +32,11 @@ __global__ void truncateKeys(uint *keys) {
     keys[index] = (keys[index] % 25000) + 1;
 }
 
+__global__ void computeCountsGlobal(uint *keys, uint *counts) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    atomicAdd((uint *)&counts[keys[index]], 1);
+}
+
 typedef struct {
     float val;
     uint key;
@@ -116,8 +121,11 @@ int main(int argc, char** argv)
     cudaEventCreate(&stop);
 
     uint  *d_keys;
+    uint  *d_counts;
     float *d_value;
     CubDebugExit(g_allocator.DeviceAllocate((void**)&d_keys, sizeof(uint) * num_items));
+    CubDebugExit(g_allocator.DeviceAllocate((void**)&d_counts, sizeof(uint) * 25001));
+    cudaMemset(d_counts, 0, sizeof(uint) * 25001);
     CubDebugExit(g_allocator.DeviceAllocate((void**)&d_value, sizeof(float) * num_items));
 
     curandGenerator_t generator;
@@ -127,6 +135,9 @@ int main(int argc, char** argv)
     curandGenerate(generator, d_keys, num_items);
     truncateKeys<<<num_items/256, 256>>>(d_keys);
     curandGenerateUniform(generator, d_value, num_items);
+
+    float time_count;
+    TIME_FUNC((computeCountsGlobal<<<num_items/256, 256>>>(d_keys, d_counts)), time_count);
 
     int hash_table_size = 65536;
     int     *d_num_selected_out   = NULL;
@@ -194,6 +205,7 @@ int main(int argc, char** argv)
 
         cout<< "{"
             << "\"time_full_agg\":" << time_full_agg
+            << "\"time_counts\":" << time_count
             << ",\"temp_storage_bytes\":" << temp_storage_bytes
             << ",\"result\":" << result
             << ",\"time_build_hash\":" << time_build_hash
@@ -209,6 +221,7 @@ int main(int argc, char** argv)
     }
 
     if (d_keys) CubDebugExit(g_allocator.DeviceFree(d_keys));
+    if (d_counts) CubDebugExit(g_allocator.DeviceFree(d_counts));
     if (d_value) CubDebugExit(g_allocator.DeviceFree(d_value));
     if (d_num_selected_out) CubDebugExit(g_allocator.DeviceFree(d_num_selected_out));
 
