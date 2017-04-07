@@ -27,6 +27,14 @@ CachingDeviceAllocator  g_allocator(true);  // Caching allocator for device memo
     t = time; \
 }
 
+#define NUM_SMS 15
+#define NUM_BLOCKS_PER_SM 2
+#define NUM_BLOCKS (NUM_SMS * NUM_BLOCKS_PER_SM)
+#define SIZE ((1 << 23) * NUM_SMS)
+#define NUM_THREADS (2048 * NUM_SMS)
+#define ITEMS_PER_THREAD (SIZE / NUM_THREADS)
+#define LOCAL_COUNTS 10
+
 __global__ void truncateKeys(uint *keys) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     keys[index] = (keys[index] % 25000) + 1;
@@ -35,6 +43,43 @@ __global__ void truncateKeys(uint *keys) {
 __global__ void computeCountsGlobal(uint *keys, uint *counts) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     atomicAdd((uint *)&counts[keys[index]], 1);
+}
+
+__global__ void computeCountsLocal(uint *keys, uint *counts) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    uint local_counts[LOCAL_COUNTS];
+    for (int i = 0; i < LOCAL_COUNTS; i++) {
+      local_counts[i] = 0;
+    }
+    for (int i = index * ITEMS_PER_THREAD; i < (index + 1) * ITEMS_PER_THREAD; i++) {
+      local_counts[keys[i]]++;
+    }
+    for (int i = 0; i < LOCAL_COUNTS; i++) {
+      counts[i * NUM_THREADS + index] = local_counts[i];
+    }
+}
+
+__global__ void computeCountsShared(uint *keys, uint *counts) {
+    __shared__ uint local_counts[LOCAL_COUNTS];
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (threadIdx.x == 0) {
+      for (int i = 0; i < LOCAL_COUNTS; i++) {
+        local_counts[i] = 0;
+      }
+    }
+    __syncthreads();
+
+    for (int i = index * ITEMS_PER_THREAD; i < (index + 1) * ITEMS_PER_THREAD; i++) {
+      atomicAdd((uint *)&local_counts[keys[i]], 1);
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+      for (int i = 0; i < LOCAL_COUNTS; i++) {
+        counts[i * NUM_BLOCKS + blockIdx.x] = local_counts[i];
+      }
+    }
 }
 
 typedef struct {
@@ -90,7 +135,7 @@ __global__ static void build_groupby_key(uint *key, float *val, T *ht, uint hsiz
 
 int main(int argc, char** argv)
 {
-    uint num_items           = 1<<28;
+    uint num_items           = SIZE;
     int num_trials          = 3;
     bool full_agg           = true;
 
@@ -139,6 +184,7 @@ int main(int argc, char** argv)
     float time_count;
     TIME_FUNC((computeCountsGlobal<<<num_items/256, 256>>>(d_keys, d_counts)), time_count);
 
+    /*
     int hash_table_size = 65536;
     int     *d_num_selected_out   = NULL;
     CubDebugExit(g_allocator.DeviceAllocate((void**)&d_num_selected_out, sizeof(int)));
@@ -219,6 +265,7 @@ int main(int argc, char** argv)
         if (hash_table) CubDebugExit(g_allocator.DeviceFree(hash_table));
         if (d_temp_storage2) CubDebugExit(g_allocator.DeviceFree(d_temp_storage2));
     }
+    */
 
     if (d_keys) CubDebugExit(g_allocator.DeviceFree(d_keys));
     if (d_counts) CubDebugExit(g_allocator.DeviceFree(d_counts));
