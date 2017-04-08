@@ -261,7 +261,7 @@ int main(int argc, char** argv)
       float time_shared_second;
       TIME_FUNC(CubDebugExit(DeviceSegmentedReduce::Sum(d_temp_storage, temp_storage_bytes, d_counts_shared, d_shared_final, COUNTS,
         d_shared_offsets, d_shared_offsets + 1)), time_shared_second);
-      cout << "\"time_shared\":" << (time_shared_first + time_shared_second) << endl;
+      cout << "\"time_shared\":" << (time_shared_first + time_shared_second) << " (" << time_shared_first << "," << time_shared_second << ")" << endl;
     }
 
     if (COUNTS * sizeof(uint) * NUM_THREADS_PER_SM < SHARED_MEM_BYTES) {
@@ -283,7 +283,7 @@ int main(int argc, char** argv)
       float time_local_second;
       TIME_FUNC(CubDebugExit(DeviceSegmentedReduce::Sum(d_temp_storage, temp_storage_bytes, d_counts_local, d_local_final, COUNTS,
         d_local_offsets, d_local_offsets + 1)), time_local_second);
-      cout << "\"time_local\":" << (time_local_first + time_local_second) << endl;
+      cout << "\"time_local\":" << (time_local_first + time_local_second)  << " (" << time_local_first << "," << time_local_second << ")" << endl;
     }
 
 
