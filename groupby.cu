@@ -8,6 +8,7 @@
 #include <cuda.h>
 #include <cub/util_allocator.cuh>
 #include <cub/device/device_reduce.cuh>
+#include <cub/device/device_segmented_reduce.cuh>
 #include <cub/device/device_select.cuh>
 
 #include "cub/test/test_util.h"
@@ -27,17 +28,30 @@ CachingDeviceAllocator  g_allocator(true);  // Caching allocator for device memo
     t = time; \
 }
 
-#define NUM_SMS 15
-#define NUM_BLOCKS_PER_SM 2
+#define NUM_SMS 24
+// must be power of two
+#define BLOCK_SIZE 256
+// must be power of two
+#define NUM_THREADS_PER_SM 2048
+#define NUM_BLOCKS_PER_SM (NUM_THREADS_PER_SM / BLOCK_SIZE)
 #define NUM_BLOCKS (NUM_SMS * NUM_BLOCKS_PER_SM)
-#define SIZE ((1 << 23) * NUM_SMS)
-#define NUM_THREADS (2048 * NUM_SMS)
+#define SIZE ((1 << 22) * NUM_SMS)
+#define NUM_THREADS (NUM_THREADS_PER_SM * NUM_SMS)
 #define ITEMS_PER_THREAD (SIZE / NUM_THREADS)
+
+// either less than BLOCK_SIZE or a multiple of BLOCK_SIZE
+#ifndef COUNTS
+#define COUNTS 1000
+// should be set to min(COUNTS, 10)
 #define LOCAL_COUNTS 10
+#endif
+
+
+#define SHARED_MEM_BYTES 64000
 
 __global__ void truncateKeys(uint *keys) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
-    keys[index] = (keys[index] % 25000) + 1;
+    keys[index] = keys[index] % COUNTS;
 }
 
 __global__ void computeCountsGlobal(uint *keys, uint *counts) {
@@ -46,25 +60,45 @@ __global__ void computeCountsGlobal(uint *keys, uint *counts) {
 }
 
 __global__ void computeCountsLocal(uint *keys, uint *counts) {
+    __shared__ uint local_counts[LOCAL_COUNTS * BLOCK_SIZE];
     int index = blockIdx.x * blockDim.x + threadIdx.x;
-    uint local_counts[LOCAL_COUNTS];
-    for (int i = 0; i < LOCAL_COUNTS; i++) {
-      local_counts[i] = 0;
+
+    int my_offset = threadIdx.x * COUNTS;
+    for (int i = 0; i < COUNTS; i++) {
+      local_counts[my_offset + i] = 0;
     }
+    // TODO __syncthreads() needed?
     for (int i = index * ITEMS_PER_THREAD; i < (index + 1) * ITEMS_PER_THREAD; i++) {
-      local_counts[keys[i]]++;
+      local_counts[my_offset + keys[i]]++;
     }
-    for (int i = 0; i < LOCAL_COUNTS; i++) {
-      counts[i * NUM_THREADS + index] = local_counts[i];
+    for (int i = 0; i < COUNTS; i++) {
+      counts[i * NUM_THREADS + index] = local_counts[my_offset + i];
+    }
+}
+
+__global__ void fillSegmentsLocal(int *offsets) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (COUNTS >= BLOCK_SIZE) {
+      offsets[index] = NUM_THREADS * index;
+    } else if (threadIdx.x == 0) {
+      for (int i = 0; i < COUNTS; i++) {
+        offsets[i] = NUM_THREADS * i;
+      }
     }
 }
 
 __global__ void computeCountsShared(uint *keys, uint *counts) {
-    __shared__ uint local_counts[LOCAL_COUNTS];
+    __shared__ uint local_counts[COUNTS];
     int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int counts_per_block_thread = COUNTS / BLOCK_SIZE;
 
-    if (threadIdx.x == 0) {
-      for (int i = 0; i < LOCAL_COUNTS; i++) {
+    if (COUNTS >= BLOCK_SIZE) {
+      for (int i = threadIdx.x * counts_per_block_thread;
+	i < (threadIdx.x + 1) * counts_per_block_thread; i++) {
+        local_counts[i] = 0;
+      }
+    } else if (threadIdx.x == 0) {
+       for (int i = 0; i < COUNTS; i++) {
         local_counts[i] = 0;
       }
     }
@@ -75,13 +109,30 @@ __global__ void computeCountsShared(uint *keys, uint *counts) {
     }
     __syncthreads();
 
-    if (threadIdx.x == 0) {
-      for (int i = 0; i < LOCAL_COUNTS; i++) {
+    if (COUNTS >= BLOCK_SIZE) {
+      for (int i = threadIdx.x * counts_per_block_thread;
+	i < (threadIdx.x + 1) * counts_per_block_thread; i++) {
+        counts[i * NUM_BLOCKS + blockIdx.x] = local_counts[i];
+      }
+    } else if (threadIdx.x == 0) {
+       for (int i = 0; i < COUNTS; i++) {
         counts[i * NUM_BLOCKS + blockIdx.x] = local_counts[i];
       }
     }
 }
 
+__global__ void fillSegmentsShared(int *offsets) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (COUNTS >= BLOCK_SIZE) {
+      offsets[index] = NUM_BLOCKS * index;
+    } else if (threadIdx.x == 0) {
+      for (int i = 0; i < COUNTS; i++) {
+        offsets[i] = NUM_BLOCKS * i;
+      }
+    }
+}
+
+/*
 typedef struct {
     float val;
     uint key;
@@ -132,6 +183,7 @@ __global__ static void build_groupby_key(uint *key, float *val, T *ht, uint hsiz
         }
     }
 }
+*/
 
 int main(int argc, char** argv)
 {
@@ -166,23 +218,74 @@ int main(int argc, char** argv)
     cudaEventCreate(&stop);
 
     uint  *d_keys;
-    uint  *d_counts;
-    float *d_value;
+    uint  *d_counts_global = NULL;
+    uint  *d_counts_shared = NULL;
+    int  *d_shared_offsets = NULL;
+    uint  *d_shared_final = NULL;
+    uint  *d_counts_local = NULL;
+    int  *d_local_offsets = NULL;
+    uint  *d_local_final = NULL;
+
     CubDebugExit(g_allocator.DeviceAllocate((void**)&d_keys, sizeof(uint) * num_items));
-    CubDebugExit(g_allocator.DeviceAllocate((void**)&d_counts, sizeof(uint) * 25001));
-    cudaMemset(d_counts, 0, sizeof(uint) * 25001);
-    CubDebugExit(g_allocator.DeviceAllocate((void**)&d_value, sizeof(float) * num_items));
+    CubDebugExit(g_allocator.DeviceAllocate((void**)&d_counts_global, sizeof(uint) * COUNTS));
+    cudaMemset(d_counts_global, 0, sizeof(uint) * COUNTS);
 
     curandGenerator_t generator;
     int seed = 0;
     curandCreateGenerator(&generator, CURAND_RNG_PSEUDO_DEFAULT);
     curandSetPseudoRandomGeneratorSeed(generator,seed);
     curandGenerate(generator, d_keys, num_items);
-    truncateKeys<<<num_items/256, 256>>>(d_keys);
-    curandGenerateUniform(generator, d_value, num_items);
+    truncateKeys<<<num_items/BLOCK_SIZE, BLOCK_SIZE>>>(d_keys);
 
-    float time_count;
-    TIME_FUNC((computeCountsGlobal<<<num_items/256, 256>>>(d_keys, d_counts)), time_count);
+    float time_global;
+    TIME_FUNC((computeCountsGlobal<<<num_items/BLOCK_SIZE, BLOCK_SIZE>>>(d_keys, d_counts_global)), time_global);
+    cout << "\"time_global\":" << time_global << endl;
+
+
+    if (COUNTS * sizeof(uint) * NUM_BLOCKS_PER_SM < SHARED_MEM_BYTES) {
+      CubDebugExit(g_allocator.DeviceAllocate((void**)&d_counts_shared, sizeof(uint) * COUNTS * NUM_BLOCKS));
+      CubDebugExit(g_allocator.DeviceAllocate((void**)&d_shared_offsets, sizeof(int) * COUNTS));
+      CubDebugExit(g_allocator.DeviceAllocate((void**)&d_shared_final, sizeof(uint) * COUNTS));
+      fillSegmentsShared<<<std::max(COUNTS/BLOCK_SIZE, 1), BLOCK_SIZE>>>(d_shared_offsets);
+
+      float time_shared_first;
+      TIME_FUNC((computeCountsShared<<<NUM_BLOCKS, BLOCK_SIZE>>>(d_keys, d_counts_shared)), time_shared_first);
+
+      void *d_temp_storage = NULL;
+      size_t temp_storage_bytes = 0;
+
+      CubDebugExit(DeviceSegmentedReduce::Sum(d_temp_storage, temp_storage_bytes, d_counts_shared, d_shared_final, COUNTS,
+        d_shared_offsets, d_shared_offsets + 1));
+      CubDebugExit(g_allocator.DeviceAllocate((void**)&d_temp_storage, temp_storage_bytes));
+
+      float time_shared_second;
+      TIME_FUNC(CubDebugExit(DeviceSegmentedReduce::Sum(d_temp_storage, temp_storage_bytes, d_counts_shared, d_shared_final, COUNTS,
+        d_shared_offsets, d_shared_offsets + 1)), time_shared_second);
+      cout << "\"time_shared\":" << (time_shared_first + time_shared_second) << endl;
+    }
+
+    if (COUNTS * sizeof(uint) * NUM_THREADS_PER_SM < SHARED_MEM_BYTES) {
+      CubDebugExit(g_allocator.DeviceAllocate((void**)&d_counts_local, sizeof(uint) * COUNTS * NUM_THREADS));
+      CubDebugExit(g_allocator.DeviceAllocate((void**)&d_local_offsets, sizeof(int) * COUNTS));
+      CubDebugExit(g_allocator.DeviceAllocate((void**)&d_local_final, sizeof(uint) * COUNTS));
+      fillSegmentsLocal<<<std::max(COUNTS/BLOCK_SIZE, 1), BLOCK_SIZE>>>(d_local_offsets);
+
+      float time_local_first;
+      TIME_FUNC((computeCountsShared<<<NUM_BLOCKS, BLOCK_SIZE>>>(d_keys, d_counts_local)), time_local_first);
+
+      void *d_temp_storage = NULL;
+      size_t temp_storage_bytes = 0;
+
+      CubDebugExit(DeviceSegmentedReduce::Sum(d_temp_storage, temp_storage_bytes, d_counts_local, d_local_final, COUNTS,
+        d_local_offsets, d_local_offsets + 1));
+      CubDebugExit(g_allocator.DeviceAllocate((void**)&d_temp_storage, temp_storage_bytes));
+
+      float time_local_second;
+      TIME_FUNC(CubDebugExit(DeviceSegmentedReduce::Sum(d_temp_storage, temp_storage_bytes, d_counts_local, d_local_final, COUNTS,
+        d_local_offsets, d_local_offsets + 1)), time_local_second);
+      cout << "\"time_local\":" << (time_local_first + time_local_second) << endl;
+    }
+
 
     /*
     int hash_table_size = 65536;
@@ -268,9 +371,13 @@ int main(int argc, char** argv)
     */
 
     if (d_keys) CubDebugExit(g_allocator.DeviceFree(d_keys));
-    if (d_counts) CubDebugExit(g_allocator.DeviceFree(d_counts));
-    if (d_value) CubDebugExit(g_allocator.DeviceFree(d_value));
-    if (d_num_selected_out) CubDebugExit(g_allocator.DeviceFree(d_num_selected_out));
+    if (d_counts_global) CubDebugExit(g_allocator.DeviceFree(d_counts_global));
+    if (d_counts_shared) CubDebugExit(g_allocator.DeviceFree(d_counts_shared));
+    if (d_shared_offsets) CubDebugExit(g_allocator.DeviceFree(d_shared_offsets));
+    if (d_shared_final) CubDebugExit(g_allocator.DeviceFree(d_shared_final));
+    if (d_counts_local) CubDebugExit(g_allocator.DeviceFree(d_counts_local));
+    if (d_local_offsets) CubDebugExit(g_allocator.DeviceFree(d_local_offsets));
+    if (d_local_final) CubDebugExit(g_allocator.DeviceFree(d_local_final));
 
     return 0;
 }
