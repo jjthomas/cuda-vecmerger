@@ -41,11 +41,11 @@ CachingDeviceAllocator  g_allocator(true);  // Caching allocator for device memo
 
 // either less than BLOCK_SIZE or a multiple of BLOCK_SIZE
 #ifndef COUNTS
-#define COUNTS 10000
+#define COUNTS 5
 // should be set to min(COUNTS, 10)
-#define LOCAL_COUNTS 10
+#define LOCAL_COUNTS 5
 // should be set to min(COUNTS, 1000)
-#define SHARED_COUNTS 1000
+#define SHARED_COUNTS 5
 #endif
 
 
@@ -75,17 +75,6 @@ __global__ void computeCountsLocal(uint *keys, uint *counts) {
     }
     for (int i = 0; i < COUNTS; i++) {
       counts[i * NUM_THREADS + index] = local_counts[my_offset + i];
-    }
-}
-
-__global__ void fillSegmentsLocal(int *offsets) {
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (COUNTS >= BLOCK_SIZE) {
-      offsets[index] = NUM_THREADS * index;
-    } else if (threadIdx.x == 0) {
-      for (int i = 0; i < COUNTS; i++) {
-        offsets[i] = NUM_THREADS * i;
-      }
     }
 }
 
@@ -119,17 +108,6 @@ __global__ void computeCountsShared(uint *keys, uint *counts) {
     } else if (threadIdx.x == 0) {
        for (int i = 0; i < COUNTS; i++) {
         counts[i * NUM_BLOCKS + blockIdx.x] = local_counts[i];
-      }
-    }
-}
-
-__global__ void fillSegmentsShared(int *offsets) {
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (COUNTS >= BLOCK_SIZE) {
-      offsets[index] = NUM_BLOCKS * index;
-    } else if (threadIdx.x == 0) {
-      for (int i = 0; i < COUNTS; i++) {
-        offsets[i] = NUM_BLOCKS * i;
       }
     }
 }
@@ -242,13 +220,19 @@ int main(int argc, char** argv)
     float time_global;
     TIME_FUNC((computeCountsGlobal<<<num_items/BLOCK_SIZE, BLOCK_SIZE>>>(d_keys, d_counts_global)), time_global);
     cout << "\"time_global\":" << time_global << endl;
+    uint *global_counts = new uint[COUNTS];
+    CubDebugExit(cudaMemcpy(global_counts, d_counts_global, COUNTS * sizeof(uint), cudaMemcpyDeviceToHost));
 
 
     if (COUNTS * sizeof(uint) * NUM_BLOCKS_PER_SM < SHARED_MEM_BYTES) {
       CubDebugExit(g_allocator.DeviceAllocate((void**)&d_counts_shared, sizeof(uint) * COUNTS * NUM_BLOCKS));
-      CubDebugExit(g_allocator.DeviceAllocate((void**)&d_shared_offsets, sizeof(int) * COUNTS));
+      CubDebugExit(g_allocator.DeviceAllocate((void**)&d_shared_offsets, sizeof(int) * (COUNTS + 1)));
       CubDebugExit(g_allocator.DeviceAllocate((void**)&d_shared_final, sizeof(uint) * COUNTS));
-      fillSegmentsShared<<<std::max(COUNTS/BLOCK_SIZE, 1), BLOCK_SIZE>>>(d_shared_offsets);
+      int *shared_offsets = new int[COUNTS + 1];
+      for (int i = 0; i <= COUNTS; i++) {
+        shared_offsets[i] = i * NUM_BLOCKS;
+      }
+      CubDebugExit(cudaMemcpy(d_shared_offsets, shared_offsets, sizeof(uint) * (COUNTS + 1), cudaMemcpyHostToDevice));
 
       float time_shared_first;
       TIME_FUNC((computeCountsShared<<<NUM_BLOCKS, BLOCK_SIZE>>>(d_keys, d_counts_shared)), time_shared_first);
@@ -264,16 +248,29 @@ int main(int argc, char** argv)
       TIME_FUNC(CubDebugExit(DeviceSegmentedReduce::Sum(d_temp_storage, temp_storage_bytes, d_counts_shared, d_shared_final, COUNTS,
         d_shared_offsets, d_shared_offsets + 1)), time_shared_second);
       cout << "\"time_shared\":" << (time_shared_first + time_shared_second) << " (" << time_shared_first << "," << time_shared_second << ")" << endl;
+
+      uint *shared_counts = new uint[COUNTS];
+      CubDebugExit(cudaMemcpy(shared_counts, d_shared_final, sizeof(uint) * COUNTS, cudaMemcpyDeviceToHost));
+      for (int i = 0; i < COUNTS; i++) {
+        if (shared_counts[i] != global_counts[i]) {
+          cout << "shared and global differ at " << i << " (" << shared_counts[i] << "," << global_counts[i] << ")" << endl;
+          break;
+        }
+      }
     }
 
     if (COUNTS * sizeof(uint) * NUM_THREADS_PER_SM < SHARED_MEM_BYTES) {
       CubDebugExit(g_allocator.DeviceAllocate((void**)&d_counts_local, sizeof(uint) * COUNTS * NUM_THREADS));
-      CubDebugExit(g_allocator.DeviceAllocate((void**)&d_local_offsets, sizeof(int) * COUNTS));
+      CubDebugExit(g_allocator.DeviceAllocate((void**)&d_local_offsets, sizeof(int) * (COUNTS + 1)));
       CubDebugExit(g_allocator.DeviceAllocate((void**)&d_local_final, sizeof(uint) * COUNTS));
-      fillSegmentsLocal<<<std::max(COUNTS/BLOCK_SIZE, 1), BLOCK_SIZE>>>(d_local_offsets);
+      int *local_offsets = new int[COUNTS + 1];
+      for (int i = 0; i <= COUNTS; i++) {
+        local_offsets[i] = i * NUM_THREADS;
+      }
+      CubDebugExit(cudaMemcpy(d_local_offsets, local_offsets, sizeof(uint) * (COUNTS + 1), cudaMemcpyHostToDevice));
 
       float time_local_first;
-      TIME_FUNC((computeCountsShared<<<NUM_BLOCKS, BLOCK_SIZE>>>(d_keys, d_counts_local)), time_local_first);
+      TIME_FUNC((computeCountsLocal<<<NUM_BLOCKS, BLOCK_SIZE>>>(d_keys, d_counts_local)), time_local_first);
 
       void *d_temp_storage = NULL;
       size_t temp_storage_bytes = 0;
@@ -286,6 +283,15 @@ int main(int argc, char** argv)
       TIME_FUNC(CubDebugExit(DeviceSegmentedReduce::Sum(d_temp_storage, temp_storage_bytes, d_counts_local, d_local_final, COUNTS,
         d_local_offsets, d_local_offsets + 1)), time_local_second);
       cout << "\"time_local\":" << (time_local_first + time_local_second)  << " (" << time_local_first << "," << time_local_second << ")" << endl;
+
+      uint *local_counts = new uint[COUNTS];
+      CubDebugExit(cudaMemcpy(local_counts, d_local_final, sizeof(uint) * COUNTS, cudaMemcpyDeviceToHost));
+      for (int i = 0; i < COUNTS; i++) {
+        if (local_counts[i] != global_counts[i]) {
+          cout << "local and global differ at " << i << " (" << local_counts[i] << "," << global_counts[i] << ")" << endl;
+          break;
+        }
+      }
     }
 
 
