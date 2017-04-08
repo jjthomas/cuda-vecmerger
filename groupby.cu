@@ -41,9 +41,11 @@ CachingDeviceAllocator  g_allocator(true);  // Caching allocator for device memo
 
 // either less than BLOCK_SIZE or a multiple of BLOCK_SIZE
 #ifndef COUNTS
-#define COUNTS 1000
+#define COUNTS 10000
 // should be set to min(COUNTS, 10)
 #define LOCAL_COUNTS 10
+// should be set to min(COUNTS, 1000)
+#define SHARED_COUNTS 1000
 #endif
 
 
@@ -88,7 +90,7 @@ __global__ void fillSegmentsLocal(int *offsets) {
 }
 
 __global__ void computeCountsShared(uint *keys, uint *counts) {
-    __shared__ uint local_counts[COUNTS];
+    __shared__ uint local_counts[SHARED_COUNTS];
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     int counts_per_block_thread = COUNTS / BLOCK_SIZE;
 
