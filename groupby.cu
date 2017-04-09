@@ -51,7 +51,8 @@ CachingDeviceAllocator  g_allocator(true);  // Caching allocator for device memo
 // arbitrary values that happen to provide the right cutoffs here
 #define SHARED_MEM_BYTES 400000
 
-#define GLOBAL_ALL 1
+// should basically never be 1, always worse than the shared memory counterparts
+#define GLOBAL_ALL 0
 
 #if GLOBAL_ALL==1
 #define SHARED_FUNC computeCountsShared2
