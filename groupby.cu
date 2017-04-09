@@ -41,17 +41,25 @@ CachingDeviceAllocator  g_allocator(true);  // Caching allocator for device memo
 
 // either less than BLOCK_SIZE or a multiple of BLOCK_SIZE
 #ifndef COUNTS
-#define COUNTS 8192
-// should be set to min(COUNTS, 8)
+#define COUNTS 8
+// should be set to min(COUNTS, 8) ... only relevant if GLOBAL_ALL==0
 #define LOCAL_COUNTS 8
-// should be set to min(COUNTS, 8192)
+// should be set to min(COUNTS, 8192) ... only relevant if GLOBAL_ALL==0
 #define SHARED_COUNTS 8192
 #endif
 
-
 // arbitrary values that happen to provide the right cutoffs here
 #define SHARED_MEM_BYTES 400000
-#define GLOBAL_MEM_BYTES 10000000000
+
+#define GLOBAL_ALL 1
+
+#if GLOBAL_ALL==1
+#define SHARED_FUNC computeCountsShared2
+#define LOCAL_FUNC computeCountsLocal2
+#else
+#define SHARED_FUNC computeCountsShared
+#define LOCAL_FUNC computeCountsLocal
+#endif
 
 __global__ void truncateKeys(uint *keys) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -83,7 +91,7 @@ __global__ void computeCountsLocal(uint *keys, uint *counts) {
 __global__ void computeCountsLocal2(uint *keys, uint *counts) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     for (int i = index * ITEMS_PER_THREAD; i < (index + 1) * ITEMS_PER_THREAD; i++) {
-      atomicAdd((uint *)&counts[keys[i] * NUM_THREADS + index], 1);
+      counts[keys[i] * NUM_THREADS + index]++;
     }
 }
 
@@ -241,8 +249,7 @@ int main(int argc, char** argv)
     uint *global_counts = new uint[COUNTS];
     CubDebugExit(cudaMemcpy(global_counts, d_counts_global, COUNTS * sizeof(uint), cudaMemcpyDeviceToHost));
 
-
-    if (COUNTS * sizeof(uint) * NUM_BLOCKS_PER_SM < SHARED_MEM_BYTES) {
+    if (GLOBAL_ALL || COUNTS * sizeof(uint) * NUM_BLOCKS_PER_SM < SHARED_MEM_BYTES) {
       CubDebugExit(g_allocator.DeviceAllocate((void**)&d_counts_shared, sizeof(uint) * COUNTS * NUM_BLOCKS));
       cudaMemset(d_counts_shared, 0, sizeof(uint) * COUNTS * NUM_BLOCKS);
       CubDebugExit(g_allocator.DeviceAllocate((void**)&d_shared_offsets, sizeof(int) * (COUNTS + 1)));
@@ -254,9 +261,9 @@ int main(int argc, char** argv)
       CubDebugExit(cudaMemcpy(d_shared_offsets, shared_offsets, sizeof(uint) * (COUNTS + 1), cudaMemcpyHostToDevice));
 
       float time_shared_first;
-      TIME_FUNC((computeCountsShared<<<NUM_BLOCKS, BLOCK_SIZE>>>(d_keys, d_counts_shared)), time_shared_first);
+      TIME_FUNC((SHARED_FUNC<<<NUM_BLOCKS, BLOCK_SIZE>>>(d_keys, d_counts_shared)), time_shared_first);
       cudaMemset(d_counts_shared, 0, sizeof(uint) * COUNTS * NUM_BLOCKS);
-      TIME_FUNC((computeCountsShared<<<NUM_BLOCKS, BLOCK_SIZE>>>(d_keys, d_counts_shared)), time_shared_first);
+      TIME_FUNC((SHARED_FUNC<<<NUM_BLOCKS, BLOCK_SIZE>>>(d_keys, d_counts_shared)), time_shared_first);
 
       void *d_temp_storage = NULL;
       size_t temp_storage_bytes = 0;
@@ -280,7 +287,7 @@ int main(int argc, char** argv)
       }
     }
 
-    if (COUNTS * sizeof(uint) * NUM_THREADS_PER_SM < SHARED_MEM_BYTES) {
+    if (GLOBAL_ALL || COUNTS * sizeof(uint) * NUM_THREADS_PER_SM < SHARED_MEM_BYTES) {
       CubDebugExit(g_allocator.DeviceAllocate((void**)&d_counts_local, sizeof(uint) * COUNTS * NUM_THREADS));
       cudaMemset(d_counts_local, 0, sizeof(uint) * COUNTS * NUM_THREADS);
       CubDebugExit(g_allocator.DeviceAllocate((void**)&d_local_offsets, sizeof(int) * (COUNTS + 1)));
@@ -292,9 +299,9 @@ int main(int argc, char** argv)
       CubDebugExit(cudaMemcpy(d_local_offsets, local_offsets, sizeof(uint) * (COUNTS + 1), cudaMemcpyHostToDevice));
 
       float time_local_first;
-      TIME_FUNC((computeCountsLocal<<<NUM_BLOCKS, BLOCK_SIZE>>>(d_keys, d_counts_local)), time_local_first);
+      TIME_FUNC((LOCAL_FUNC<<<NUM_BLOCKS, BLOCK_SIZE>>>(d_keys, d_counts_local)), time_local_first);
       cudaMemset(d_counts_local, 0, sizeof(uint) * COUNTS * NUM_THREADS);
-      TIME_FUNC((computeCountsLocal<<<NUM_BLOCKS, BLOCK_SIZE>>>(d_keys, d_counts_local)), time_local_first);
+      TIME_FUNC((LOCAL_FUNC<<<NUM_BLOCKS, BLOCK_SIZE>>>(d_keys, d_counts_local)), time_local_first);
 
       void *d_temp_storage = NULL;
       size_t temp_storage_bytes = 0;
