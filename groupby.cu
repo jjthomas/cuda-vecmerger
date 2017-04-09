@@ -50,9 +50,13 @@ CachingDeviceAllocator  g_allocator(true);  // Caching allocator for device memo
 
 // arbitrary values that happen to provide the right cutoffs here
 #define SHARED_MEM_BYTES 400000
+#define GLOBAL_MEM_BYTES 5000000000
 
-// should basically never be 1, always worse than the shared memory counterparts
+#if COUNTS > 8192
+#define GLOBAL_ALL 1
+#else
 #define GLOBAL_ALL 0
+#endif
 
 #if GLOBAL_ALL==1
 #define SHARED_FUNC computeCountsShared2
@@ -288,7 +292,8 @@ int main(int argc, char** argv)
       }
     }
 
-    if (GLOBAL_ALL || COUNTS * sizeof(uint) * NUM_THREADS_PER_SM < SHARED_MEM_BYTES) {
+    if ((GLOBAL_ALL && sizeof(uint) * COUNTS * NUM_THREADS < GLOBAL_MEM_BYTES)
+        || (!GLOBAL_ALL && COUNTS * sizeof(uint) * NUM_THREADS_PER_SM < SHARED_MEM_BYTES)) {
       CubDebugExit(g_allocator.DeviceAllocate((void**)&d_counts_local, sizeof(uint) * COUNTS * NUM_THREADS));
       cudaMemset(d_counts_local, 0, sizeof(uint) * COUNTS * NUM_THREADS);
       CubDebugExit(g_allocator.DeviceAllocate((void**)&d_local_offsets, sizeof(int) * (COUNTS + 1)));
